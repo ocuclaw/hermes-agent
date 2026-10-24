@@ -241,12 +241,17 @@ async def execute_admission(authority, ref, row):
     live = authority.sessions[ref.session_id]
     native = row['admission_id'] in authority.native_waiters
     authority.native_waiters.discard(row['admission_id'])
+    from gateway.session_operator import is_viewer_input
     if 'native_text_v1' in row['payload']:
         event = restore_native(row['payload'], authority.runner)
     else:
         from gateway.session_ingress_media import restore_attachments
+        # A viewer's prompt (Desktop, TUI) into a messaging chat has no channel inputs of its own:
+        # it reuses the chat's pinned channel prompt and parent like a synthetic turn (#126109),
+        # instead of pinning None and dropping them from this and every later internal turn.
         event = MessageEvent(text=row['payload']['text'], source=live.source,
-                             message_id=row['admission_id'], **restore_attachments(row['payload']))
+                             message_id=row['admission_id'], inherit_channel_pin=is_viewer_input(row),
+                             **restore_attachments(row['payload']))
         if 'local_automation_v1' in row['payload']:
             from gateway.session_automation import restore_local_automation
             event = restore_local_automation(authority, ref, row)
@@ -270,7 +275,6 @@ async def execute_admission(authority, ref, row):
         event._claimed_owner = (ref.session_id, row['generation'])
     author = event.metadata.get('turn_author')
     author_token = admission_author.set(author if author is not None else row_turn_author(local_policy, row))
-    from gateway.session_operator import is_viewer_input
     viewer_token = viewer_turn.set(live if is_viewer_input(row) else None)
     api_token = api_execution.set(None)
     captured = {}

@@ -11,6 +11,7 @@ reaches ``_run_agent`` is byte-identical on all three turns.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import types
 from datetime import datetime
@@ -503,6 +504,58 @@ async def test_goal_continuation_keeps_channel_pin_through_session_authority(tmp
         authority.db.close()
 
     assert [kw["channel_prompt"] for kw in calls] == ["Channel hint."] * 3
+    pin = runner._peek_session_state(runner._session_key_for_source(source)).conversation.channel_pin
+    assert pin[0] == "Channel hint."
+
+
+@pytest.mark.asyncio
+async def test_viewer_submit_into_a_chat_keeps_its_channel_pin(tmp_path, monkeypatch):
+    """A prompt a session viewer (Desktop, TUI) submits into a messaging chat carries no channel
+    inputs of its own. It must reuse the chat's pins like a synthetic turn (#126109): pinning its
+    own None ran it without the channel prompt, and the next platform turn rebuilt the agent
+    (A->B->A). Real GatewayRunner, WhatsAppAdapter, SessionAuthority and ``execute_admission``."""
+    import gateway.run as gr
+    from gateway.platforms.base import SendResult
+    from gateway.session_authority import initialize_session_authority
+    from gateway.session_contract import Principal, Submission
+    from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
+    from tests.waiting import async_wait_until
+
+    chat = "15551234567@s.whatsapp.net"
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "15551234567")
+    monkeypatch.setattr(gr, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    runner = gr.GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
+    adapter = WhatsAppAdapter(PlatformConfig(enabled=True, extra={
+        "text_batch_delay_seconds": 0, "session_path": str(tmp_path / "wa")}))
+    adapter.gateway_runner, runner.adapters = runner, {Platform.WHATSAPP: adapter}
+    authority = await initialize_session_authority(runner, profile_id="default", instance_id="pins")
+    runner._wire_adapter_handlers(adapter)
+    calls: list[dict] = []
+    _capture(runner, calls)
+    monkeypatch.setattr(adapter, "send", AsyncMock(return_value=SendResult(success=True, message_id="s")))
+    source = adapter.build_source(chat_id=chat, user_id=chat, chat_type="dm")
+    viewer = Principal("authenticated-viewer", "default", frozenset({"session:submit"}), "viewer")
+
+    def ran(want):
+        return lambda: len(calls) >= want and not adapter._background_tasks and not adapter._session_tasks
+
+    try:
+        await adapter.handle_message(MessageEvent(text="hi", source=source, message_id="h1",
+                                                  channel_prompt="Channel hint."))
+        await async_wait_until(ran(1), timeout=60, what="the platform turn")
+        ref = authority.register(source)
+        await asyncio.wait_for(authority.submit(
+            viewer, Submission("v1", ref, {"text": "typed in Desktop"}, "queue")), 60)
+        await async_wait_until(ran(2), timeout=60, what="the viewer turn")
+        await adapter.handle_message(MessageEvent(text="hi again", source=source, message_id="h2",
+                                                  channel_prompt="Channel hint."))
+        await async_wait_until(ran(3), timeout=60, what="the next platform turn")
+    finally:
+        authority.db.close()
+
+    assert [kw["message"] for kw in calls][1] == "typed in Desktop"
+    assert [kw["channel_prompt"] for kw in calls] == ["Channel hint."] * 3
+    assert calls[0]["context_prompt"] == calls[1]["context_prompt"] == calls[2]["context_prompt"]
     pin = runner._peek_session_state(runner._session_key_for_source(source)).conversation.channel_pin
     assert pin[0] == "Channel hint."
 
